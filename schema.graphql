@@ -1,0 +1,50 @@
+type Restaurant {
+  id: ID!
+  name: String!
+  description: String
+  address: String!
+  city: String!
+  state: String!
+  zip: Int!
+  longitude: Float!
+  latitude: Float!
+}
+
+type Like {
+  user: String!
+  restaurantId: ID!
+}
+
+type SearchResult {
+  restaurant: Restaurant!
+  distance: String
+  units: String
+}
+
+input GPSInput {
+  latitude: Float!
+  longitude: Float!
+  radius: Float
+}
+
+type Query {
+  listRestaurants(limit: Int, nextToken: String): [Restaurant]
+  getRestaurant(id: ID!): Restaurant
+  searchByLocation(location: GPSInput!): [SearchResult]
+  getRecommendationsFor(user: String!): [Restaurant]
+}
+
+type Mutation {
+  addLike(user: String!, restaurantId: ID!): Like
+}
+
+type Subscription {
+  onLike(user: String): Like
+    @aws_subscribe(mutations: ["addLike"])
+}
+
+schema {
+  query: Query
+  mutation: Mutation
+  subscription: Subscription
+}

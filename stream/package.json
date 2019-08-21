@@ -1,0 +1,11 @@
+{
+  "name": "aws-appsync-alternative-data-sources-stream",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "author": "jkahn",
+  "license": "ISC",
+  "dependencies": {
+    "ioredis": "^4.10.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "aws-appsync-alternative-data-sources-neptune",
+  "version": "1.0.0",
+  "description": "Integrated AppSync with Neptune",
+  "main": "index.js",
+  "author": "jkahn",
+  "license": "Apache2.0",
+  "dependencies": {
+    "gremlin": "^3.4.2"
+  }
+}

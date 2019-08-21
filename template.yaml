@@ -1,0 +1,709 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Enabling alternative data sources with AWS AppSync
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: alternative-data-sources
+
+  ElasticacheInstanceClass:
+    Type: String
+    Default: cache.t2.micro
+
+  NeptuneInstanceClass:
+    Type: String
+    Default: db.r4.large
+
+
+Globals:
+  Function:
+    Runtime: nodejs10.x
+    Handler: index.handler
+    MemorySize: 512
+    Timeout: 15
+    Tags:
+      Project: !Ref ProjectName
+
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    Private1:
+      CIDR: '10.0.0.0/24'
+    Private2:
+      CIDR: '10.0.1.0/24'
+    Lambda1:
+      CIDR: '10.0.2.0/24'
+    Lambda2:
+      CIDR: '10.0.3.0/24'
+    Public1:
+      CIDR: '10.0.4.0/24'
+
+Resources:
+  ## AppSync ##
+  RestaurantApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      AuthenticationType: API_KEY
+      Name: aws-appsync-alt-data-sources
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncServiceRole.Arn
+        FieldLogLevel: "ALL"
+
+  RestaurantApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Description: API Key for Restaurant API
+
+  RestaurantSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      DefinitionS3Location: schema.graphql
+
+  ListRestaurantsQueryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      TypeName: Query
+      FieldName: listRestaurants
+      DataSourceName: !GetAtt RestaurantsTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version" : "2017-02-28",
+          "operation" : "Scan",
+          "limit": $util.defaultIfNull(${ctx.args.limit}, 20),
+          "nextToken": $util.toJson($util.defaultIfNullOrBlank($ctx.args.nextToken, null))
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  GetRestaurantQueryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      TypeName: Query
+      FieldName: getRestaurant
+      DataSourceName: !GetAtt RestaurantsTableDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "GetItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.id),
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  SearchByLocationQueryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      TypeName: Query
+      FieldName: searchByLocation
+      Kind: PIPELINE
+      PipelineConfig:
+        Functions:
+          - !GetAtt SearchByLocationFunction.FunctionId
+          - !GetAtt BatchGetRestaurantsFunction.FunctionId
+      RequestMappingTemplate: |
+        {}
+      ResponseMappingTemplate: |
+        #set($distances = $ctx.stash.get("distances"))
+        #set($result = [])
+
+        #foreach($item in $ctx.prev.result)
+          #set($idx = $foreach.count - 1)
+          #set($dist = $distances.get($idx))
+          #set($r = {
+            "restaurant": $item,
+            "distance": $dist.dist,
+            "units": $dist.units
+          })
+          $util.qr($result.add($r))
+        #end
+        $util.toJson($result)
+
+  GetRecommendationsForQueryResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      TypeName: Query
+      FieldName: getRecommendationsFor
+      Kind: PIPELINE
+      PipelineConfig:
+        Functions:
+          - !GetAtt GetRecommendationsFunction.FunctionId
+          - !GetAtt BatchGetRestaurantsFunction.FunctionId
+      RequestMappingTemplate: |
+        {}
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  AddLikeMutationResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      TypeName: Mutation
+      FieldName: addLike
+      DataSourceName: !GetAtt NeptuneIntegrationDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "action": "addLike",
+            "arguments":  $utils.toJson($ctx.arguments)
+          }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.result && $ctx.result.error)
+          $util.error($ctx.result.error)
+        #end
+        $util.toJson($ctx.arguments)
+
+  SearchByLocationFunction:
+    Type: AWS::AppSync::FunctionConfiguration
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: search_by_location_elasticache
+      Description: >
+        Queries ElastiCache to find a listing of restaurants IDs in a given
+        search radius from provide coordinates.
+      DataSourceName: !GetAtt ElastiCacheIntegrationDataSource.Name
+      FunctionVersion: "2018-05-29"
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "action": "searchByLocation",
+            "arguments":  $utils.toJson($ctx.arguments)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.qr($ctx.stash.put("distances", $ctx.result))
+        #if($ctx.result && $ctx.result.error)
+          $util.error($ctx.result.error)
+        #end
+        $util.toJson($ctx.result)
+
+  GetRecommendationsFunction:
+    Type: AWS::AppSync::FunctionConfiguration
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: get_recommendations_neptune
+      Description: >
+        Queries Neptune to retrieve recommendations for the passed
+        user.
+      DataSourceName: !GetAtt NeptuneIntegrationDataSource.Name
+      FunctionVersion: "2018-05-29"
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "action": "getRecommendations",
+            "arguments":  $utils.toJson($ctx.arguments)
+          }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.result && $ctx.result.error)
+          $util.error($ctx.result.error)
+        #end
+        $util.toJson($ctx.result)
+
+  BatchGetRestaurantsFunction:
+    Type: AWS::AppSync::FunctionConfiguration
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: batch_get_restaurants_ddb
+      Description: >
+        Retrieves batch of restaurants details from DynamoDB.
+      DataSourceName: !GetAtt RestaurantsTableDataSource.Name
+      FunctionVersion: "2018-05-29"
+      RequestMappingTemplate: !Sub |
+        #set($ids = [])
+        #foreach($result in $ctx.prev.result)
+          #set($map = {})
+          $util.qr($map.put("id", $util.dynamodb.toString($result.id)))
+          $util.qr($ids.add($map))
+        #end
+        {
+          "version" : "2018-05-29",
+          "operation" : "BatchGetItem",
+          "tables" : {
+              "${RestaurantsTable}": {
+                  "keys": $util.toJson($ids),
+                  "consistentRead": true
+              }
+          }
+        }
+      ResponseMappingTemplate: !Sub |
+        #if($ctx.result && $ctx.result.error)
+          $util.error($ctx.result.error)
+        #end
+        $util.toJson($ctx.result.data.${RestaurantsTable})
+
+
+  # ElastiCache Integration Data Source
+  ElastiCacheIntegrationDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: ElastiCacheIntegration
+      Description: Lambda function to integrate with Elasticache
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt ElastiCacheIntegrationFunction.Arn
+
+  # Neptune Integration Data Source
+  NeptuneIntegrationDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: NeptuneIntegration
+      Description: Lambda function to integrate with Neptune
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt NeptuneIntegrationFunction.Arn
+
+  # DynamoDB Data Source -- Restaurants Table
+  RestaurantsTableDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt RestaurantApi.ApiId
+      Name: RestaurantsTable
+      Description: Restaurants table
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref RestaurantsTable
+        AwsRegion: !Sub ${AWS::Region}
+
+  ## ElastiCache ##
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      AutoMinorVersionUpgrade: true
+      # enable Cluster Mode
+      CacheParameterGroupName: default.redis5.0.cluster.on
+      CacheNodeType: !Ref ElasticacheInstanceClass
+      CacheSubnetGroupName:  !Ref RedisSubnetGroup
+      Engine: redis
+      EngineVersion: 5.0.4
+      NumNodeGroups: 1
+      Port: 6379
+      ReplicasPerNodeGroup: 1
+      ReplicationGroupDescription: AppSync Alternative Data Sources
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable Redis access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ## Neptune ##
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    Properties:
+      DBClusterIdentifier: !Ref ProjectName
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-neptune-cluster"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: !Ref NeptuneInstanceClass
+      DBInstanceIdentifier: !Sub "${ProjectName}-neptune"
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-neptune-instance"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${ProjectName} Subnet Group"
+      DBSubnetGroupName: !Sub "${ProjectName}-subnet-group"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-neptune-subnet-group"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-neptune-security-group"
+      GroupDescription: Allow access to Amazon Neptune from Lambda
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ## Lambda ##
+  ElastiCacheIntegrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: elasticache/
+      Description: Integrates AWS AppSync with ElastiCache
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          ELASTICACHE_ENDPOINT: !GetAtt RedisCluster.ConfigurationEndPoint.Address
+          ELASTICACHE_PORT: !GetAtt RedisCluster.ConfigurationEndPoint.Port
+          ELASTICACHE_GEO_KEY: 'restaurants:geo'
+
+  NeptuneIntegrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: neptune/
+      Handler: index.handler
+      Description: Integrates AWS AppSync with Neptune
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
+          NEPTUNE_PORT: "8182"
+
+  StreamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: stream/
+      Description: Published updates from DynamoDB Stream to ElastiCache and Neptune
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          ELASTICACHE_ENDPOINT: !GetAtt RedisCluster.ConfigurationEndPoint.Address
+          ELASTICACHE_PORT: !GetAtt RedisCluster.ConfigurationEndPoint.Port
+          ELASTICACHE_GEO_KEY: 'restaurants:geo'
+      Events:
+        StreamEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt RestaurantsTable.StreamArn
+            StartingPosition: LATEST
+
+  DDBSetupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: setup/
+      Description: Adds mock data to DynamoDB table
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RestaurantsTable
+      Environment:
+        Variables:
+          RESTAURANT_TABLE: !Ref RestaurantsTable
+
+  NeptuneSetupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: setup/
+      Handler: neptune.handler
+      Description: Adds mock data to Neptune
+      Timeout: 30
+      Policies:
+        - VPCAccessPolicy: {}
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref LambdaSubnet1
+          - !Ref LambdaSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !GetAtt NeptuneCluster.Endpoint
+          NEPTUNE_PORT: "8182"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable Redis and Neptune access
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ## DynamoDB ##
+  RestaurantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TableName: !Sub ${ProjectName}-restaurants-table
+
+  ## Step Functions ##
+  SetupStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: aws-appsync-alt-data-sources
+      RoleArn: !GetAtt SetupStateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Setup data demo",
+          "StartAt": "Setup DynamoDB",
+          "States": {
+            "Setup DynamoDB": {
+              "Type": "Task",
+              "Resource": "${DDBSetupFunction.Arn}",
+              "ResultPath": "$",
+              "TimeoutSeconds": 10,
+              "Next": "Wait for One Minute",
+              "Catch": [{
+                "ErrorEquals": [ "States.ALL" ],
+                "ResultPath": "$.error",
+                "Next": "HandleError"
+              }]
+            },
+            "Wait for One Minute": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "Setup Neptune"
+            },
+            "Setup Neptune": {
+              "Type": "Task",
+              "Resource": "${NeptuneSetupFunction.Arn}",
+              "ResultPath": "$",
+              "TimeoutSeconds": 30,
+              "Catch": [{
+                "ErrorEquals": [ "States.ALL" ],
+                "ResultPath": "$.error",
+                "Next": "HandleError"
+              }],
+              "End": true
+            },
+            "HandleError": {
+              "Type": "Fail",
+              "Cause": "$.error"
+            }
+          }
+        }
+
+  ## IAM ##
+  SetupStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: aws-appsync-alt-data-sources-sfn-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub states.${AWS::Region}.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DDBSetupFunction.Arn
+                  - !GetAtt NeptuneSetupFunction.Arn
+
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      RoleName: aws-appsync-alt-data-sources-service-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+      Policies:
+        - PolicyName: aws-appsync-alt-data-sources-service-role-lambda-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ElastiCacheIntegrationFunction.Arn
+                  - !GetAtt NeptuneIntegrationFunction.Arn
+        - PolicyName: aws-daily-news-appsync-service-role-ddb-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt RestaurantsTable.Arn
+                  - !Sub "${RestaurantsTable.Arn}/*"
+
+  ## VPC ##
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Private1', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-1"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Private2', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-private-subnet-2"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Lambda1', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-subnet-1"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  LambdaSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: !Ref AWS::Region
+      VpcId: !Ref VPC
+      CidrBlock:  !FindInMap ['SubnetConfig', 'Lambda2', 'CIDR']
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-lambda-subnet-2"
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  ApiEndpoint:
+    Description: AppSync Endpoint
+    Value: !GetAtt RestaurantApi.GraphQLUrl
+
+  ApiId:
+    Description: AppSync API ID
+    Value: !GetAtt RestaurantApi.ApiId
+
+  ApiKey:
+    Description: AppSync API Key
+    Value: !GetAtt RestaurantApiKey.ApiKey
+
+  SetupStateMachine:
+    Description: ARN of Setup State Machine
+    Value: !Ref SetupStateMachine

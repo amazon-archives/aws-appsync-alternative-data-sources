@@ -1,0 +1,6 @@
+{
+  "action": "getRecommendations",
+  "arguments": {
+    "user": "Dorothy"
+  }
+}

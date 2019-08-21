@@ -1,0 +1,11 @@
+{
+  "name": "aws-appsync-alternative-data-sources-elasticache",
+  "version": "1.0.0",
+  "description": "Integrates AppSync with ElastiCache",
+  "main": "index.js",
+  "author": "jkahn",
+  "license": "Apache2.0",
+  "dependencies": {
+    "ioredis": "^4.10.0"
+  }
+}

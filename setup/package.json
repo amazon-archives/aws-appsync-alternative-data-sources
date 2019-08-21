@@ -1,0 +1,13 @@
+{
+  "name": "aws-appsync-alternative-data-sources-setup",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "dependencies": {
+    "aws-sdk": "^2.486.0",
+    "gremlin": "^3.4.2"
+  },
+  "devDependencies": {},
+  "author": "jkahn",
+  "license": "ISC"
+}

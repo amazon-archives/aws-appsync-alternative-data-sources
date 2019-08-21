@@ -1,0 +1,7 @@
+{
+  "action": "addLike",
+  "arguments": {
+    "user": "Joe",
+    "restaurantId": "478452A9-6C9E-4D44-AA80-92EFDECC45A6"
+  }
+}
