@@ -6,7 +6,7 @@ As CTO and VP of [Amazon.com](http://amazon.com/), Werner Vogels, has [pointed o
 
 In this project, we explore how AWS AppSync can utilize [AWS Lambda](https://aws.amazon.com/lambda/) to integrate with alternative data sources, those not supported out-of-the-box by AppSync. In specific, we will focus on Amazon ElastiCache (in-memory database) and Amazon Neptune (graph database) to build functionality of a Chicago-style hot dog finder.
 
-Further detail on this project can be found in the accompanying [blog post](#).
+Further detail on this project can be found in the accompanying [blog post](https://aws.amazon.com/blogs/mobile/integrating-aws-appsync-neptune-elasticache/).
 
 ## Getting Started
 
